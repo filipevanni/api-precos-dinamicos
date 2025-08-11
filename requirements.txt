@@ -1,5 +1,4 @@
 Flask
-gunicorn
-unidecode
 requests
 beautifulsoup4
+gunicorn
