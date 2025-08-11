@@ -1,192 +1,216 @@
-import os
-import re
+# app.py
+from __future__ import annotations
 import csv
 import io
+import os
+import time
+from typing import Dict, Tuple, List
+
 import requests
-import unidecode
 from flask import Flask, request, jsonify
+import unidecode
 
 app = Flask(__name__)
 
-# =========================================
+# =========================
+# Config via ambiente
+# =========================
+# Link público do Google Sheets (export CSV) contendo as colunas:
+#   material, preco
+# ou  materiais, preco
+MATERIAIS_URL = os.getenv("MATERIAIS_URL", "").strip()
+
+# Cache para evitar baixar a planilha a cada request
+CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 min padrão
+_CACHE_DATA: Dict[str, int] = {}
+_CACHE_RAW_NAMES: Dict[str, str] = {}
+_CACHE_TS: float = 0.0
+
+
+# =========================
 # Normalização de nomes
-# =========================================
-def norm_nome(txt: str) -> str:
-    if txt is None:
-        return ""
-    t = unidecode.unidecode(txt.lower())
-    t = re.sub(r"\bde\b", " ", t)   # remove 'de' como palavra
+# =========================
+def normaliza_nome(txt: str) -> str:
+    """
+    - minúsculo
+    - sem acento
+    - remove ' de ' isolado
+    - troca hífen por espaço
+    - compacta espaços
+    """
+    t = unidecode.unidecode(txt.strip().lower())
+    t = t.replace(" de ", " ")
     t = t.replace("-", " ")
     t = " ".join(t.split())
     return t
 
-# =========================================
-# Util: URL CSV do Google Sheets
-# Aceita pubhtml e converte para CSV
-# =========================================
-def to_csv_url(url: str) -> str:
+
+# =========================
+# Carregar / cachear planilha
+# =========================
+def _baixar_planilha(url: str) -> Tuple[Dict[str, int], Dict[str, str]]:
+    """
+    Baixa CSV e devolve:
+      - dict normalizado->preco_int
+      - dict normalizado->nome_original (para mensagens)
+    """
     if not url:
-        return ""
-    if "output=csv" in url:
-        return url
-    if "/pubhtml" in url:
-        url = url.replace("/pubhtml", "/pub")
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}output=csv"
-    return url
+        raise RuntimeError("MATERIAIS_URL não configurada nas variáveis de ambiente.")
 
-# =========================================
-# Parse de preço tolerante
-# "R$ 1.497,00" -> 1497 (int)
-# =========================================
-def parse_preco(v) -> int | None:
-    if v is None:
-        return None
-    s = str(v).strip()
-    if not s:
-        return None
-    s = s.replace(".", "")
-    s = s.replace(",", ".")
-    try:
-        return int(round(float(s)))
-    except Exception:
-        # fallback: pega só dígitos
-        digs = "".join(ch for ch in s if ch.isdigit())
-        return int(digs) if digs else None
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
 
-# =========================================
-# Catálogo de materiais (preços unitários)
-# norm_name -> {"preco": int, "display": str}
-# =========================================
-MATERIAIS_URL = os.getenv("MATERIAIS_URL", "").strip()  # coloque a URL CSV aqui nas envs do Render
-CATALOGO = {}
+    data_norm_to_price: Dict[str, int] = {}
+    data_norm_to_raw: Dict[str, str] = {}
 
-def carregar_catalogo():
-    global CATALOGO
-    CATALOGO.clear()
-    url = to_csv_url(MATERIAIS_URL)
-    if not url:
-        app.logger.warning("MATERIAIS_URL não definido nas variáveis de ambiente.")
-        return
+    f = io.StringIO(r.text)
+    reader = csv.DictReader(f)
 
-    try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-    except Exception as e:
-        app.logger.error(f"Falha ao baixar planilha de materiais: {e}")
-        return
+    # aceita cabeçalhos: "material" ou "materiais" (singular/plural) e "preco"
+    possible_name_cols = ["material", "materiais", "nome", "nome_material"]
+    name_col = None
+    for c in reader.fieldnames or []:
+        c2 = c.strip().lower()
+        if c2 in possible_name_cols:
+            name_col = c
+    if not name_col:
+        raise RuntimeError(
+            "Cabeçalho não encontrado. Esperado colunas 'material' (ou 'materiais') e 'preco'."
+        )
 
-    content = r.content.decode("utf-8", errors="ignore")
-    reader = csv.DictReader(io.StringIO(content))
+    # acha coluna de preço
+    price_col = None
+    for c in reader.fieldnames or []:
+        if c.strip().lower() in ("preco", "preço", "price"):
+            price_col = c
+    if not price_col:
+        raise RuntimeError("Coluna de preço não encontrada (ex.: 'preco').")
 
-    # tolera cabeçalhos com variações
-    # esperamos pelo menos: materiais | preco
-    linhas = 0
-    lidas = 0
     for row in reader:
-        linhas += 1
-        mat = row.get("materiais") or row.get("material") or row.get("nome") or ""
-        preco_raw = row.get("preco") or row.get("preço") or row.get("preco (r$)") or ""
-
-        mat = str(mat).strip()
-        if not mat:
+        raw_name = (row.get(name_col) or "").strip()
+        raw_price = (row.get(price_col) or "").strip()
+        if not raw_name:
+            continue
+        try:
+            # aceita 1497 ou 1497,00 ou 1.497 etc.
+            p = (
+                raw_price.replace(".", "")
+                .replace("R$", "")
+                .replace(" ", "")
+                .replace(",", ".")
+            )
+            price_int = int(round(float(p)))
+        except Exception:
             continue
 
-        preco = parse_preco(preco_raw)
-        if preco is None:
-            continue
+        norm = normaliza_nome(raw_name)
+        data_norm_to_price[norm] = price_int
+        data_norm_to_raw[norm] = raw_name
 
-        key = norm_nome(mat)
-        if not key:
-            continue
+    if not data_norm_to_price:
+        raise RuntimeError("Nenhum material válido encontrado no CSV.")
 
-        CATALOGO[key] = {"preco": preco, "display": mat}
-        lidas += 1
+    return data_norm_to_price, data_norm_to_raw
 
-    app.logger.info(f"Catálogo carregado: {lidas}/{linhas} linhas válidas. Materiais únicos: {len(CATALOGO)}")
 
-# carrega ao iniciar
-carregar_catalogo()
+def _garantir_cache() -> None:
+    global _CACHE_DATA, _CACHE_RAW_NAMES, _CACHE_TS
+    now = time.time()
+    if now - _CACHE_TS > CACHE_TTL or not _CACHE_DATA:
+        data, raw = _baixar_planilha(MATERIAIS_URL)
+        _CACHE_DATA = data
+        _CACHE_RAW_NAMES = raw
+        _CACHE_TS = now
 
-# =========================================
-# (Opcional) categorização simples
-# Se tiver algum material “premium”, marca como Couro Premium; senão Casual Urbano
-# Você pode ajustar a regra/Lista a seu gosto
-# =========================================
-PREMIUM_KEYS = {
-    norm_nome(n) for n in [
-        "Couro de Jacaré", "Couro de Python", "Couro de Avestruz",
-        "Couro de Pirarucu", "Couro de Elefante"
-    ]
-}
 
-def classificar_categoria(keys_norm: list[str]) -> str:
-    return "Couro Premium" if any(k in PREMIUM_KEYS for k in keys_norm) else "Casual Urbano"
-
-# =========================================
+# =========================
 # Endpoints
-# =========================================
-@app.route("/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "materiais_catalogo": len(CATALOGO),
-        "exemplo": "/preco?materiais=Couro Bovino, Couro de Tilápia, Jeans"
-    })
+# =========================
+@app.route("/ping")
+def ping():
+    return jsonify({"ok": True, "service": "api-precos-dinamicos"})
 
 @app.route("/materiais")
 def materiais():
-    # lista o catálogo carregado
-    itens = sorted([v["display"] for v in CATALOGO.values()], key=lambda x: x.lower())
-    return jsonify({"itens": itens, "total": len(itens)})
+    """
+    Lista materiais disponíveis e seus preços base.
+    """
+    try:
+        _garantir_cache()
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
-@app.route("/reload", methods=["POST"])
-def reload():
-    # recarrega o catálogo sem redeploy
-    carregar_catalogo()
-    return jsonify({"ok": True, "materiais_catalogo": len(CATALOGO)})
+    itens = [
+        {"material": _CACHE_RAW_NAMES[k], "preco": v}
+        for k, v in sorted(_CACHE_DATA.items())
+    ]
+    return jsonify({"materiais": itens, "fonte": MATERIAIS_URL})
+
 
 @app.route("/preco")
 def preco():
     """
-    GET /preco?materiais=A, B, C[, D ...]
-    Calcula (soma dos preços unitários) / N e retorna inteiro.
+    Exemplo de chamada:
+      /preco?materiais=Couro Bovino, Couro de Tilápia, Jeans
+    Regra: preço = média simples dos preços base.
     """
-    materiais_str = (request.args.get("materiais") or "").strip()
-    if not materiais_str:
-        return jsonify({"erro": "Materiais não informados"}), 400
+    q = request.args.get("materiais", "").strip()
+    if not q:
+        return jsonify({"erro": "Parâmetro 'materiais' é obrigatório."}), 400
 
-    # separa por vírgula
-    itens = [p.strip() for p in materiais_str.split(",") if p.strip()]
-    if not itens:
-        return jsonify({"erro": "Nenhum material válido informado"}), 400
+    try:
+        _garantir_cache()
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
-    # normaliza cada um e tenta achar no catálogo
-    keys_norm = [norm_nome(p) for p in itens]
-    desconhecidos = [itens[i] for i, k in enumerate(keys_norm) if k not in CATALOGO]
+    orig_list = [m.strip() for m in q.split(",") if m.strip()]
+    if not orig_list:
+        return jsonify({"erro": "Nenhum material informado."}), 400
+
+    norm_list = [normaliza_nome(m) for m in orig_list]
+
+    desconhecidos: List[str] = []
+    usados: List[Dict[str, int]] = []
+    soma = 0
+
+    for n, original in zip(norm_list, orig_list):
+        if n not in _CACHE_DATA:
+            desconhecidos.append(original)
+            continue
+        price = _CACHE_DATA[n]
+        usados.append({"material": _CACHE_RAW_NAMES[n], "preco": price})
+        soma += price
 
     if desconhecidos:
-        return jsonify({
-            "erro": "Alguns materiais não existem no catálogo",
-            "materiais_desconhecidos": desconhecidos
-        }), 404
+        # sugere catálogo disponível
+        disponiveis = sorted(_CACHE_RAW_NAMES.values())
+        return (
+            jsonify(
+                {
+                    "erro": "Materiais desconhecidos.",
+                    "nao_encontrados": desconhecidos,
+                    "sugestoes_disponiveis": disponiveis,
+                }
+            ),
+            400,
+        )
 
-    # soma dos preços / N
-    soma = sum(CATALOGO[k]["preco"] for k in keys_norm)
-    n = len(keys_norm)
-    preco_final = round(soma / n)  # arredonda para inteiro
+    # Fórmula de precificação: média simples
+    media = soma / max(len(usados), 1)
+    preco_final = int(round(media))
 
-    categoria = classificar_categoria(keys_norm)
-
-    return jsonify({
-        "materiais": itens,            # ecoa como veio (bonitinho)
-        "preco": int(preco_final),     # inteiro
-        "categoria": categoria,
-        "detalhes": {
-            "soma_precos_unitarios": soma,
-            "quantidade_materiais": n
+    return jsonify(
+        {
+            "materiais": [u["material"] for u in usados],
+            "itens_precificados": usados,  # detalha base usada
+            "regra": "media_simples",
+            "preco": preco_final,
         }
-    })
+    )
 
+
+# -------------------------
+# Exec local
+# -------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
