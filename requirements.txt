@@ -1,0 +1,5 @@
+Flask
+gunicorn
+unidecode
+requests
+beautifulsoup4
